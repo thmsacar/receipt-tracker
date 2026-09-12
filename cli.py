@@ -159,41 +159,8 @@ SYSTEM_PROMPT = """Rôle : Extraction et numérisation de tickets de caisse de c
 
 
 # ==============================================================================
-# Store and Market Normalization
+# Normalization and Matching Utilities
 # ==============================================================================
-
-CANONICAL_MARKET_MAP: Dict[str, str] = {
-    # Butcher shops & local stores
-    "acem": "Boucherie Acem",
-    "boucherie acem": "Boucherie Acem",
-    "boucherie saint bruno": "Boucherie Saint Bruno",
-    "boucherie st bruno": "Boucherie Saint Bruno",
-    "saint bruno": "Boucherie Saint Bruno",
-    "st bruno": "Boucherie Saint Bruno",
-    # Supermarkets & hypermarkets
-    "carrefour express": "Carrefour Express",
-    "carrefour": "Carrefour",
-    "lidl": "Lidl",
-    "monoprix": "Monoprix",
-    "auchan": "Auchan",
-    "leclerc": "E.Leclerc",
-    "e.leclerc": "E.Leclerc",
-    "intermarche": "Intermarché",
-    "intermarché": "Intermarché",
-    "casino": "Casino",
-    "franprix": "Franprix",
-    "aldi": "Aldi",
-    # Specialized retail
-    "action": "Action",
-    "ikea": "Ikea",
-    "h&m": "H&M",
-    "decathlon": "Decathlon",
-    # Produce & greengrocers
-    "manav / primeur": "Manav / Primeur",
-    "primeur": "Manav / Primeur",
-    "manav": "Manav / Primeur",
-}
-
 
 def normalize_category(cat: Optional[str]) -> str:
     """Normalize a category string to the allowed taxonomy."""
@@ -212,30 +179,78 @@ def normalize_market_name(
     market: Optional[str],
     existing_markets: Optional[Iterable[str]] = None,
 ) -> str:
-    """Normalize store name to canonical brand name."""
+    """Normalize store name by matching against existing known markets using fuzzy matching."""
     if not market or not str(market).strip():
         return "Commerce local"
 
     clean = re.sub(r"\(.*?\)", "", str(market)).strip()
     clean = re.sub(r"\s+", " ", clean)
-    clean_lower = clean.lower()
 
-    for key in sorted(CANONICAL_MARKET_MAP.keys(), key=len, reverse=True):
-        if key in clean_lower:
-            return CANONICAL_MARKET_MAP[key]
+    if existing_markets is None:
+        try:
+            p = Path("receipts.json")
+            if p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        existing_markets = [r.get("market") for r in data if r.get("market")]
+        except Exception:
+            existing_markets = None
 
-    if clean_lower.startswith("boucherie ace") or clean_lower.startswith("acem"):
-        return "Boucherie Acem"
+    if not existing_markets:
+        return clean.title()
 
-    all_targets = set(CANONICAL_MARKET_MAP.values())
-    if existing_markets:
-        for em in existing_markets:
-            if em and str(em).strip():
-                all_targets.add(str(em).strip())
+    existing_list = [m for m in existing_markets if m and str(m).strip()]
+    if not existing_list:
+        return clean.title()
 
-    matches = difflib.get_close_matches(clean, list(all_targets), n=1, cutoff=0.75)
-    if matches:
-        return matches[0]
+    # 1. Exact case-insensitive match
+    for em in existing_list:
+        if clean.lower() == em.lower():
+            return em
+
+    def simplify(s: str) -> str:
+        s = s.lower()
+        s = re.sub(r"\bst\b", "saint", s)
+        s = re.sub(r"\bste\b", "sainte", s)
+        s = re.sub(r"[^\w\s]", " ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    s_clean = simplify(clean)
+
+    # 2. Simplified match (abbreviations and punctuation)
+    for em in existing_list:
+        if s_clean == simplify(em):
+            return em
+
+    tokens_clean = set(s_clean.split())
+    best_match = None
+    best_score = 0.0
+
+    # 3. Fuzzy similarity & token containment
+    for em in existing_list:
+        s_em = simplify(em)
+        tokens_em = set(s_em.split())
+
+        intersection = tokens_clean & tokens_em
+        union = tokens_clean | tokens_em
+        jaccard = len(intersection) / len(union) if union else 0.0
+
+        subset_score = 0.0
+        if intersection:
+            smaller_len = min(len(tokens_clean), len(tokens_em))
+            if len(intersection) == smaller_len:
+                subset_score = 0.8 + (len(intersection) / max(len(tokens_clean), len(tokens_em))) * 0.15
+
+        ratio = difflib.SequenceMatcher(None, s_clean, s_em).ratio()
+        score = max(ratio, jaccard, subset_score)
+
+        if score > best_score:
+            best_score = score
+            best_match = em
+
+    if best_match and best_score >= 0.75:
+        return best_match
 
     return clean.title()
 
@@ -246,7 +261,8 @@ def find_duplicate_receipt(
     image_hash: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Check if receipt already exists by image hash, receipt number, or date/amount match."""
-    m_new = normalize_market_name(receipt.get("market"))
+    known_markets = [r.get("market") for r in existing_receipts if r.get("market")]
+    m_new = normalize_market_name(receipt.get("market"), existing_markets=known_markets)
     d_new = receipt.get("date")
     tot_new = float(receipt.get("total_amount") or 0.0)
     no_new = str(receipt.get("receipt_no") or "").strip()
@@ -255,7 +271,7 @@ def find_duplicate_receipt(
         if image_hash and r.get("image_hash") and r.get("image_hash") == image_hash:
             return r
 
-        m_old = normalize_market_name(r.get("market"))
+        m_old = normalize_market_name(r.get("market"), existing_markets=known_markets)
         d_old = r.get("date")
         tot_old = float(r.get("total_amount") or 0.0)
         no_old = str(r.get("receipt_no") or "").strip()
@@ -291,10 +307,10 @@ def sort_receipts_chronologically(receipts: List[Dict[str, Any]]) -> List[Dict[s
     return reindexed
 
 
-def normalize_receipt_dict(r: Dict[str, Any], default_index: Optional[int] = None) -> Dict[str, Any]:
+def normalize_receipt_dict(r: Dict[str, Any], default_index: Optional[int] = None, existing_markets: Optional[Iterable[str]] = None) -> Dict[str, Any]:
     """Normalize raw receipt dictionary to standard schema."""
     raw_market = r.get("market") or "Commerce local"
-    market = normalize_market_name(raw_market)
+    market = normalize_market_name(raw_market, existing_markets=existing_markets)
     branch = r.get("branch")
     m_paren = re.search(r"\((.*?)\)", str(raw_market))
     if m_paren:
@@ -402,8 +418,10 @@ def compute_financial_statistics(receipts: List[Dict[str, Any]]) -> Dict[str, An
     market_spend: Dict[str, float] = {}
     market_counts: Dict[str, int] = {}
 
+    known_markets = [r.get("market") for r in receipts if r.get("market")]
+
     for r in receipts:
-        m = normalize_market_name(r.get("market") or "Inconnu")
+        m = normalize_market_name(r.get("market") or "Inconnu", existing_markets=known_markets)
         market_spend[m] = market_spend.get(m, 0.0) + float(r.get("total_amount", 0.0))
         market_counts[m] = market_counts.get(m, 0) + 1
 
@@ -1003,7 +1021,8 @@ def migrate(
     console.print(f"[dim]Sauvegarde de secours créée : {backup_path.name}[/dim]")
 
     receipts_raw = load_receipts(file)
-    normalized = [normalize_receipt_dict(r) for r in receipts_raw]
+    known_markets = [r.get("market") for r in receipts_raw if r.get("market")]
+    normalized = [normalize_receipt_dict(r, existing_markets=known_markets) for r in receipts_raw]
     sorted_receipts = sort_receipts_chronologically(normalized)
     save_receipts(file, sorted_receipts)
     sync_excel_file(file, Path("depenses.xlsx"))

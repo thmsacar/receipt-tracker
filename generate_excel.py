@@ -28,7 +28,6 @@ sys.dont_write_bytecode = True
 # Taxonomy and normalizers from cli.py (with standalone fallback)
 try:
     from cli import (
-        CANONICAL_MARKET_MAP,
         CATEGORIES_ALIMENTAIRES,
         CATEGORIES_NON_ALIMENTAIRES,
         CATEGORIES_VALIDES as CATEGORIES_FR,
@@ -49,54 +48,73 @@ except ImportError:
     ]
     CATEGORIES_FR = CATEGORIES_ALIMENTAIRES + CATEGORIES_NON_ALIMENTAIRES
 
-    CANONICAL_MARKET_MAP = {
-        "acem": "Boucherie Acem",
-        "boucherie ace": "Boucherie Acem",
-        "boucherie acem": "Boucherie Acem",
-        "boucherie saint bruno": "Boucherie Saint Bruno",
-        "boucherie st bruno": "Boucherie Saint Bruno",
-        "saint bruno": "Boucherie Saint Bruno",
-        "st bruno": "Boucherie Saint Bruno",
-        "carrefour express": "Carrefour Express",
-        "carrefour": "Carrefour",
-        "lidl": "Lidl",
-        "monoprix": "Monoprix",
-        "auchan": "Auchan",
-        "leclerc": "E.Leclerc",
-        "e.leclerc": "E.Leclerc",
-        "intermarche": "Intermarché",
-        "intermarché": "Intermarché",
-        "casino": "Casino",
-        "franprix": "Franprix",
-        "aldi": "Aldi",
-        "action": "Action",
-        "ikea": "Ikea",
-        "h&m": "H&M",
-        "decathlon": "Decathlon",
-        "manav / primeur": "Manav / Primeur",
-        "primeur": "Manav / Primeur",
-        "manav": "Manav / Primeur",
-    }
-
     def normalize_market_name(market: Optional[str], existing_markets: Optional[Iterable[str]] = None) -> str:
-        """Normalize store name to canonical brand."""
+        """Normalize store name by matching against existing known markets."""
         if not market or not str(market).strip():
             return "Commerce local"
         clean = re.sub(r"\(.*?\)", "", str(market)).strip()
         clean = re.sub(r"\s+", " ", clean)
-        clean_lower = clean.lower()
-        for key in sorted(CANONICAL_MARKET_MAP.keys(), key=len, reverse=True):
-            if key in clean_lower:
-                return CANONICAL_MARKET_MAP[key]
-        if clean_lower.startswith("boucherie ace") or clean_lower.startswith("acem"):
-            return "Boucherie Acem"
-        all_targets = set(CANONICAL_MARKET_MAP.values())
-        if existing_markets:
-            for em in existing_markets:
-                if em and str(em).strip():
-                    all_targets.add(str(em).strip())
-        matches = difflib.get_close_matches(clean, list(all_targets), n=1, cutoff=0.75)
-        return matches[0] if matches else clean.title()
+
+        if existing_markets is None:
+            try:
+                p = Path("receipts.json")
+                if p.exists():
+                    with open(p, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            existing_markets = [r.get("market") for r in data if r.get("market")]
+            except Exception:
+                existing_markets = None
+
+        if not existing_markets:
+            return clean.title()
+
+        existing_list = [m for m in existing_markets if m and str(m).strip()]
+        if not existing_list:
+            return clean.title()
+
+        for em in existing_list:
+            if clean.lower() == em.lower():
+                return em
+
+        def simplify(s: str) -> str:
+            s = s.lower()
+            s = re.sub(r"\bst\b", "saint", s)
+            s = re.sub(r"\bste\b", "sainte", s)
+            s = re.sub(r"[^\w\s]", " ", s)
+            return re.sub(r"\s+", " ", s).strip()
+
+        s_clean = simplify(clean)
+
+        for em in existing_list:
+            if s_clean == simplify(em):
+                return em
+
+        tokens_clean = set(s_clean.split())
+        best_match = None
+        best_score = 0.0
+
+        for em in existing_list:
+            s_em = simplify(em)
+            tokens_em = set(s_em.split())
+            intersection = tokens_clean & tokens_em
+            union = tokens_clean | tokens_em
+            jaccard = len(intersection) / len(union) if union else 0.0
+            subset_score = 0.0
+            if intersection:
+                smaller_len = min(len(tokens_clean), len(tokens_em))
+                if len(intersection) == smaller_len:
+                    subset_score = 0.8 + (len(intersection) / max(len(tokens_clean), len(tokens_em))) * 0.15
+            ratio = difflib.SequenceMatcher(None, s_clean, s_em).ratio()
+            score = max(ratio, jaccard, subset_score)
+            if score > best_score:
+                best_score = score
+                best_match = em
+
+        if best_match and best_score >= 0.75:
+            return best_match
+
+        return clean.title()
 
     def normalize_category_fr(cat: Optional[str]) -> str:
         """Normalize category string to the allowed taxonomy."""
@@ -446,6 +464,7 @@ class ExpenseAggregator:
             return d
 
         data = sorted(raw_receipts, key=sort_key)
+        known_markets = [r.get("market") for r in data if r.get("market")]
 
         total_spend_all = 0.0
         total_items_all = 0
@@ -471,7 +490,7 @@ class ExpenseAggregator:
         for idx, r in enumerate(data, start=1):
             date_str = str(r.get("date") or "-")
             r_id = r.get("id") or f"{date_str}_{idx:02d}"
-            m = normalize_market_name(r.get("market", ""))
+            m = normalize_market_name(r.get("market", ""), existing_markets=known_markets)
             branch = r.get("branch") or ""
             tot = float(r.get("total_amount") or 0.0)
 
@@ -953,6 +972,8 @@ def _write_receipts_worksheet(
         ws.write(0, c_idx, h, fmt.tbl_hdr if is_ctr else fmt.tbl_hdr_left)
     ws.set_row(0, 24)
 
+    known_markets = [r.get("market") for r in summary.sorted_receipts if r.get("market")]
+
     for i, r in enumerate(summary.sorted_receipts):
         row = i + 1
         is_z = (i % 2 == 1)
@@ -968,7 +989,7 @@ def _write_receipts_worksheet(
 
         ws.write(row, 0, i + 1, c_center)
         ws.write(row, 1, r_id, c_center)
-        ws.write(row, 2, normalize_market_name(r.get("market", "")), c_left)
+        ws.write(row, 2, normalize_market_name(r.get("market", ""), existing_markets=known_markets), c_left)
         ws.write(row, 3, r.get("branch") or "", c_left)
         ws.write(row, 4, r.get("date") or "", c_center)
         ws.write(row, 5, r.get("receipt_no") or "-", c_center)
