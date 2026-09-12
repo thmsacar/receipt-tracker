@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.env
+.DS_Store
+~$*.xlsx
+*.bak.json
+.venv/
+
+# Local data files
+receipts.json
+*.xlsx
