@@ -1,60 +1,42 @@
 # Receipt Tracker
 
-CLI tool to scan store receipts using Gemini Flash, track expenses in JSON, and export to Excel.
-
-## Requirements
-
-- Python 3.10+
-- Google Gemini API key
+Scan store receipts with Gemini Flash and track expenses in Excel.
 
 ## Setup
 
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# Set your GEMINI_API_KEY in .env
 ```
 
-## Commands
+Add your `GEMINI_API_KEY` in `.env`.
 
-### Scan a receipt
+## CLI Usage
+
+Scan a receipt:
 ```bash
-python cli.py add /path/to/receipt.jpg
+python cli.py add receipt.jpg
 ```
-Extracts items, normalizes product names, categorizes each item, appends to `receipts.json`, and updates `depenses.xlsx`.
 
-### List receipts
+Other commands:
+- `python cli.py list` - list receipts
+- `python cli.py show <id>` - show receipt items
+- `python cli.py stats` - show spending stats
+- `python cli.py export` - update depenses.xlsx
+
+## Telegram Bot
+
+You can also run the Telegram bot:
 ```bash
-python cli.py list
+python bot.py
 ```
 
-### View receipt details
-```bash
-python cli.py show 1
-# or by ID
-python cli.py show 2026-09-04_01
-```
+Set `TELEGRAM_BOT_TOKEN` in `.env`.
+To restrict access to your household, set `TELEGRAM_ALLOWED_USER_IDS=123,456`.
 
-### View stats
-```bash
-python cli.py stats
-```
-
-### Export to Excel
-```bash
-python cli.py export
-```
-
-## Excel Output (`depenses.xlsx`)
-
-Generates 4 sheets:
-- Synthèse Globale: KPIs, food vs non-food breakdown, store totals, and charts.
-- Articles Alimentaires: Food items table with auto-filters.
-- Tickets de Caisse: Chronological receipt log.
-- Tous les Articles: Complete item-level log.
-
-## Files
-
-- `cli.py`: Main CLI tool (scan, list, show, stats, export).
-- `generate_excel.py`: Excel workbook generator using XlsxWriter.
-- `receipts.json`: Local database of parsed receipts.
+In Telegram:
+- Send a photo to scan and save it
+- `/stats` - spending stats
+- `/list` - list receipts (with paging buttons)
+- `/show <id>` - show receipt items
+- `/export` - download depenses.xlsx
