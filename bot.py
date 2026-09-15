@@ -11,6 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from datetime import date
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -74,7 +75,7 @@ def format_receipt_detail(receipt: Dict[str, Any], index: int) -> str:
     r_id = html.escape(receipt.get("id", "-"))
     market = html.escape(receipt.get("market", "Commerce local"))
     branch = f" <i>({html.escape(receipt.get('branch'))})</i>" if receipt.get("branch") else ""
-    date = html.escape(receipt.get("date", "-"))
+    date = html.escape(receipt.get("date") or "-")
     receipt_no = html.escape(receipt.get("receipt_no") or "-")
     total = float(receipt.get("total_amount") or 0.0)
     items = receipt.get("items") or []
@@ -444,7 +445,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         dup_by_hash = next((r for r in current_receipts if r.get("image_hash") == image_hash), None)
         if dup_by_hash:
-            d_date = html.escape(dup_by_hash.get("date", "-"))
+            d_date = html.escape(dup_by_hash.get("date") or "-")
             d_market = html.escape(dup_by_hash.get("market", "-"))
             d_tot = float(dup_by_hash.get("total_amount") or 0.0)
             await status_msg.edit_text(
@@ -458,6 +459,9 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         receipt_dict = parsed_data.model_dump()
         receipt_dict["image_hash"] = image_hash
 
+        if not receipt_dict.get("date"):
+            receipt_dict["date"] = date.today().isoformat()
+
         existing_markets = [r.get("market") for r in current_receipts if r.get("market")]
         receipt_dict["market"] = normalize_market_name(receipt_dict.get("market"), existing_markets=existing_markets)
 
@@ -465,7 +469,7 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if dup:
             d_id = html.escape(dup.get("id", "-"))
             d_market = html.escape(dup.get("market", "-"))
-            d_date = html.escape(dup.get("date", "-"))
+            d_date = html.escape(receipt.get("date") or "-")
             d_tot = float(dup.get("total_amount") or 0.0)
             await status_msg.edit_text(
                 f"<b>Duplicate Receipt Detected:</b>\n"
@@ -496,6 +500,59 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if tmp_path.exists():
             tmp_path.unlink()
 
+async def text_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle plain text questions about receipts using Gemini with auto language matching."""
+    if not update.effective_user or not update.message or not update.message.text:
+        return
+
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized.")
+        return
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        await update.message.reply_text("GEMINI_API_KEY is missing in .env.")
+        return
+
+    user_query = update.message.text.strip()
+    status_msg = await update.message.reply_text("Analyzing your expenses...")
+
+    receipts = load_receipts(RECEIPTS_PATH)
+    if not receipts:
+        await status_msg.edit_text("No receipts recorded yet to analyze.")
+        return
+
+    # Prompt
+    prompt = f"""
+            You are an intelligent, concise personal finance assistant.
+            Below is the user's current receipt and expense dataset in JSON format:
+            {json.dumps(receipts, ensure_ascii=False)}
+
+            User message/question:
+            "{user_query}"
+
+            INSTRUCTIONS:
+            1. Detect the language of the user's message (Turkish, Russian, French, English, etc.).
+            2. Reply strictly in the SAME language as the user's message.
+            3. Keep the response concise, clear, and focused on expense insights or data requested.
+            4. Format prices with two decimals and currency (e.g., 12.50 €).
+            5. If the user asks something outside expenses or financial queries, answer politely and briefly in that same language.
+            """
+
+    model_name = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+    try:
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+        )
+        answer = response.text or "No response generated."
+        await status_msg.edit_text(answer)
+    except Exception as e:
+        logger.exception("Error during text assistant query")
+        await status_msg.edit_text(f"Error: {str(e)}")
 
 def main() -> None:
     """Run the bot."""
@@ -515,6 +572,7 @@ def main() -> None:
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message_handler))
 
     print("Bot is running...")
     app.run_polling()
